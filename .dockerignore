@@ -1,0 +1,16 @@
+.git
+ViMoS
+videos
+videos_fixed
+data
+logs
+__pycache__
+*.pyc
+.venv
+venv
+.vscode
+docs
+template
+*.zip
+*.tar.gz
+!IsaacGym_Preview_4_Package.tar.gz

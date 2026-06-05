@@ -67,3 +67,33 @@ legged_gym/legged_gym/scripts/wandb
 # other
 *.egg-info
 __pycache__
+
+# === Marcos additions ===
+# Large binaries / archives
+IsaacGym_Preview_4_Package.tar.gz
+*.tar.gz
+*.zip
+
+# Training artifacts
+training_logs/*.log
+legged_gym/logs/
+
+# Broken symlink (recreated inside container)
+legged_gym/resources/datasets/goalkeeper
+!legged_gym/resources/datasets/goalkeeper.orig/
+!legged_gym/resources/datasets/goalkeeper.orig/**
+
+# Memories (copilot session)
+/memories/
+
+# Force include generated videos (override the global *.mp4 rule)
+!videos/
+!videos/*.mp4
+!videos_fixed/
+!videos_fixed/*.mp4
+!data/
+!data/replays/
+!data/replays/*.mp4
+
+# Repos externos embedados (usar como submodule)
+/ViMoS/
