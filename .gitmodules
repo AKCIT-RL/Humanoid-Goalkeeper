@@ -1,0 +1,4 @@
+[submodule "ViMoS"]
+	path = ViMoS
+	url = https://github.com/AKCIT-RL/ViMoS.git
+	branch = dev
