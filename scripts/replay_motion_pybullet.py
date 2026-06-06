@@ -103,16 +103,25 @@ def main():
     print(f"Active joints: {list(pb_joint_map.keys())}")
 
     # Build mapping: pybullet_joint_idx -> motion_data_col_idx
+    # Prefer dof_names embedded in the trajectory (matches joint_position columns 1:1).
+    # Fallback to joint_id.txt mapping if dof_names is absent.
     dof_mapping = []
-    for joint_name, pb_idx in pb_joint_map.items():
-        if joint_name in joint_id_map:
-            motion_idx = joint_id_map[joint_name]
-            dof_mapping.append((pb_idx, motion_idx))
+    motion_dof_names = data.get("dof_names")
+    if motion_dof_names is not None:
+        name_to_motion_idx = {name: i for i, name in enumerate(motion_dof_names)}
+        for joint_name, pb_idx in pb_joint_map.items():
+            if joint_name in name_to_motion_idx:
+                dof_mapping.append((pb_idx, name_to_motion_idx[joint_name]))
+        print(f"Mapped {len(dof_mapping)}/{len(pb_joint_map)} PyBullet joints via dof_names ({len(motion_dof_names)} motion DoFs)")
+    else:
+        for joint_name, pb_idx in pb_joint_map.items():
+            if joint_name in joint_id_map:
+                motion_idx = joint_id_map[joint_name]
+                dof_mapping.append((pb_idx, motion_idx))
+        print(f"Mapped {len(dof_mapping)} joints via joint_id.txt fallback")
 
-    print(f"Mapped {len(dof_mapping)} joints between motion data and URDF")
-
-    # Camera setup
-    cam_distance = 2.5
+    # Camera setup (target updated per-frame to follow the robot)
+    cam_distance = 3.0
     cam_yaw = 45
     cam_pitch = -20
     cam_target = [0.0, 0.0, 0.7]
@@ -124,6 +133,9 @@ def main():
         base_pos = data["base_position"][t].tolist()
         base_quat = data["base_pose"][t].tolist()
         p.resetBasePositionAndOrientation(robot_id, base_pos, base_quat)
+
+        # Camera follows the robot (env_origins offset means robot is not at world origin)
+        cam_target = [base_pos[0], base_pos[1], base_pos[2] + 0.2]
 
         # Set joint positions
         joint_pos = data["joint_position"][t]

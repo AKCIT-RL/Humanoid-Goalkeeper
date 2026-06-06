@@ -16,7 +16,8 @@ import torch
 # Ensure legged_gym is importable (works inside Docker at /workspace)
 sys.path.insert(0, "/workspace/legged_gym")
 
-from legged_gym.envs.g1.g1_utils import MotionLib, load_imitation_dataset
+# Imported lazily inside run_dry_run() for --robot=g1 only; T1 mode does not
+# need MotionLib (which is G1-specific: 29 DoF, fixed padding, etc.).
 
 # 29 DOF names in URDF order (from g1_29.urdf revolute joints)
 DOF_NAMES = [
@@ -33,6 +34,21 @@ DOF_NAMES = [
     "right_wrist_yaw_joint",
 ]
 
+# T1 canonical joint order (23 DoF, matches scripts/convert_gmr_to_goalkeeper.py
+# and ViMoS/retarget/GMR/assets/booster_t1/T1_serial.xml).
+T1_DOF_NAMES = [
+    "AAHead_yaw", "Head_pitch",
+    "Left_Shoulder_Pitch", "Left_Shoulder_Roll",
+    "Left_Elbow_Pitch", "Left_Elbow_Yaw",
+    "Right_Shoulder_Pitch", "Right_Shoulder_Roll",
+    "Right_Elbow_Pitch", "Right_Elbow_Yaw",
+    "Waist",
+    "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
+    "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
+    "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
+    "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll",
+]
+
 # No "keyframe" links in g1_29.urdf, so this is empty
 KEYFRAME_NAMES = []
 
@@ -47,7 +63,7 @@ REQUIRED_KEYS = [
     "link_position", "link_oritentation", "lin_velocity", "link_angular_velocity",
 ]
 
-EXPECTED_SHAPES = {
+EXPECTED_SHAPES_G1 = {
     "base_position": ("N", 3),
     "base_pose": ("N", 4),
     "base_velocity": ("N", 3),
@@ -59,6 +75,18 @@ EXPECTED_SHAPES = {
     "lin_velocity": ("N", 17, 3),
     "link_angular_velocity": ("N", 17, 3),
 }
+
+EXPECTED_SHAPES_T1 = {
+    "base_position": ("N", 3),
+    "base_pose": ("N", 4),
+    "base_velocity": ("N", 3),
+    "base_angular_velocity": ("N", 3),
+    "joint_position": ("N", 23),
+    "joint_velocity": ("N", 23),
+}
+
+# Keep backward-compatible name used elsewhere; set at runtime from --robot.
+EXPECTED_SHAPES = EXPECTED_SHAPES_G1
 
 
 def check_shapes(data, name):
@@ -88,10 +116,17 @@ def check_shapes(data, name):
     return issues, n_frames
 
 
-def run_dry_run(folder, mapping_path):
+def run_dry_run(folder, mapping_path, robot="g1"):
     print(f"\n{'='*60}")
-    print(f"DRY-RUN: {folder}")
+    print(f"DRY-RUN: {folder}  (robot={robot})")
     print(f"{'='*60}")
+
+    # Select expected schema for this robot.
+    global EXPECTED_SHAPES
+    if robot == "t1":
+        EXPECTED_SHAPES = EXPECTED_SHAPES_T1
+    else:
+        EXPECTED_SHAPES = EXPECTED_SHAPES_G1
 
     # Step 1: raw torch.load validation
     pt_files = sorted([f for f in os.listdir(folder) if f.endswith(".pt")])
@@ -119,6 +154,13 @@ def run_dry_run(folder, mapping_path):
             continue
 
         issues, n_frames = check_shapes(data, motion_name)
+        # Extra checks: NaN, finite ranges
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                if torch.isnan(v).any():
+                    issues.append(f"  NaN in '{k}'")
+                if torch.isinf(v).any():
+                    issues.append(f"  Inf in '{k}'")
         extra_keys = set(data.keys()) - set(EXPECTED_SHAPES.keys()) - {"link_orientation", "link_velocity", "base_velocity"}
         results[motion_name] = {
             "status": "OK" if not issues else "SHAPE_ISSUES",
@@ -138,6 +180,30 @@ def run_dry_run(folder, mapping_path):
         status = r["status"]
         issues_str = "; ".join(r.get("issues", [r.get("error", "")])) or "-"
         print(f"{name:<12} {str(n):>6} {status:<14} {issues_str}")
+
+    # For T1: MotionLib is G1-specific (29 DoF, padding); skip steps 2-3.
+    if robot == "t1":
+        # Cross-check that --mapping length matches T1 expectation (23 DoF).
+        try:
+            with open(mapping_path) as f:
+                n_map = sum(1 for line in f if line.strip())
+        except Exception as e:
+            print(f"\n  Could not read mapping {mapping_path}: {e}")
+            return False
+        if n_map != 23:
+            print(f"\n  ERROR: mapping has {n_map} entries, expected 23 for T1")
+            all_ok = False
+        else:
+            print(f"\n  Mapping {mapping_path}: {n_map} entries (OK for T1)")
+        print(f"\n  Steps 2/3 (MotionLib instantiation, get_expert_obs): SKIPPED — "
+              f"MotionLib is G1-specific (29 DoF). T1 validation is schema-only.")
+        print(f"\n{'='*60}")
+        print(f"RESULT: {'ALL PASSED' if all_ok else 'SOME FAILURES'}")
+        print(f"{'='*60}\n")
+        return all_ok
+
+    # G1 path: lazily import MotionLib.
+    from legged_gym.envs.g1.g1_utils import MotionLib, load_imitation_dataset
 
     # Step 2: MotionLib instantiation via load_imitation_dataset
     print(f"\n--- Step 2: MotionLib instantiation ---")
@@ -206,9 +272,20 @@ def run_dry_run(folder, mapping_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dry-run MotionLib validation")
+    parser = argparse.ArgumentParser(
+        description="Dry-run MotionLib validation. For --robot=g1 instantiates "
+                    "MotionLib + tests get_expert_obs; for --robot=t1 runs "
+                    "schema-only validation (MotionLib is G1-specific)."
+    )
     parser.add_argument("--folder", required=True, help="Path to folder with .pt files")
     parser.add_argument("--mapping", default=None, help="Path to joint_id.txt (default: <folder>/joint_id.txt or standard goalkeeper path)")
+    parser.add_argument(
+        "--robot",
+        choices=["g1", "t1"],
+        default="g1",
+        help="Robot family. 'g1' instantiates MotionLib (29 DoF, fixed padding); "
+             "'t1' does schema-only validation (23 DoF, no MotionLib).",
+    )
     args = parser.parse_args()
 
     folder = args.folder
@@ -241,8 +318,9 @@ def main():
 
     print(f"Folder:  {folder}")
     print(f"Mapping: {mapping_path}")
+    print(f"Robot:   {args.robot}")
 
-    ok = run_dry_run(folder, mapping_path)
+    ok = run_dry_run(folder, mapping_path, robot=args.robot)
     sys.exit(0 if ok else 1)
 
 

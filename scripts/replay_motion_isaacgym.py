@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Kinematic replay of goalkeeper motions in IsaacGym with offscreen rendering to MP4."""
+# KNOWN ISSUE: Booster T1 URDF currently segfaults in IsaacGym Preview 4 during
+# asset/actor creation. Workaround: use scripts/replay_motion_pybullet.py for T1.
 import argparse
 import os
 import sys
@@ -82,6 +84,14 @@ def main():
     parser.add_argument("--motion", required=True, help="Path to .pt motion file")
     parser.add_argument("--urdf", required=True, help="Path to robot URDF")
     parser.add_argument("--output_mp4", required=True, help="Output MP4 path")
+    parser.add_argument(
+        "--mapping",
+        default=None,
+        help="Path to joint_id.txt mapping (lines '<idx> <joint_name>'). "
+             "If omitted, falls back to the .pt's 'dof_names' key, or to the "
+             "default G1 joint_id.txt at "
+             "/workspace/legged_gym/resources/datasets/goalkeeper/joint_id.txt.",
+    )
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--width", type=int, default=640)
@@ -113,14 +123,27 @@ def main():
     # Load motion data
     data = load_motion(motion_path)
     n_frames = data["base_position"].shape[0]
-    n_joints_motion = data["joint_position"].shape[1]  # 21
+    n_joints_motion = data["joint_position"].shape[1]
     print(f"Motion frames: {n_frames}, joints in data: {n_joints_motion}")
 
-    # Load joint mapping
-    mapping_path = "/workspace/legged_gym/resources/datasets/goalkeeper/joint_id.txt"
-    with open(mapping_path) as f:
-        lines = [l.strip().split() for l in f.readlines()]
-    joint_id_map = {name: int(idx) for idx, name in lines}
+    # Resolve joint mapping (motion joint name -> motion joint index).
+    # Priority: 1) explicit --mapping file, 2) 'dof_names' inside the .pt,
+    # 3) fallback to default G1 joint_id.txt.
+    if args.mapping is not None:
+        mapping_path = args.mapping
+        with open(mapping_path) as f:
+            lines = [l.strip().split() for l in f.readlines() if l.strip()]
+        joint_id_map = {name: int(idx) for idx, name in lines}
+        print(f"Mapping: {mapping_path} ({len(joint_id_map)} joints)")
+    elif "dof_names" in data:
+        joint_id_map = {name: i for i, name in enumerate(data["dof_names"])}
+        print(f"Mapping: from .pt 'dof_names' ({len(joint_id_map)} joints)")
+    else:
+        mapping_path = "/workspace/legged_gym/resources/datasets/goalkeeper/joint_id.txt"
+        with open(mapping_path) as f:
+            lines = [l.strip().split() for l in f.readlines() if l.strip()]
+        joint_id_map = {name: int(idx) for idx, name in lines}
+        print(f"Mapping: {mapping_path} (fallback G1, {len(joint_id_map)} joints)")
 
     # Initialize IsaacGym
     gym = gymapi.acquire_gym()
@@ -224,8 +247,8 @@ def main():
                                                  gymtorch.unwrap_tensor(actor_idx), 1)
 
         # Set DOF positions as targets
-        joint_pos = data["joint_position"][t]  # (21,)
-        joint_vel = data["joint_velocity"][t]  # (21,)
+        joint_pos = data["joint_position"][t]  # (n_joints_motion,)
+        joint_vel = data["joint_velocity"][t]  # (n_joints_motion,)
 
         for sim_idx, motion_idx in dof_mapping:
             dof_state_tensor[sim_idx, 0] = joint_pos[motion_idx].item()
