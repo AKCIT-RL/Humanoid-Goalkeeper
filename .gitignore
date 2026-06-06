@@ -94,6 +94,14 @@ legged_gym/resources/datasets/goalkeeper
 !data/
 !data/replays/
 !data/replays/*.mp4
+!data/g1_videos/
+!data/g1_videos/*.mp4
+!data/t1_videos/
+!data/t1_videos/*.mp4
+!data/play_videos/
+!data/play_videos/*.mp4
+!tests/videos_t1/
+!tests/videos_t1/*.mp4
 
 # Repos externos embedados (usar como submodule)
 /ViMoS/
