@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Convert GMR retargeted PKL files to goalkeeper .pt dataset format."""
+from __future__ import annotations
 
 import argparse
 import os
 import pickle
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -160,6 +162,110 @@ def apply_z_offset(
     raise ValueError(f"Unknown z_offset_strategy: {strategy}")
 
 
+def compute_foot_grounded_offset(
+    root_pos: np.ndarray,
+    root_quat: np.ndarray,
+    joint_position: np.ndarray,
+    dof_names: list[str],
+    urdf_path: str,
+    ground_z: float = 0.0,
+    foot_margin: float = 0.005,
+    foot_sole_offset: float = 0.03,
+    left_foot_link: str = "left_foot_link",
+    right_foot_link: str = "right_foot_link",
+) -> tuple[np.ndarray, float]:
+    """Compute a single Z offset so that the lowest foot sole over the whole
+    motion sits at ``ground_z + foot_margin``.
+
+    Uses PyBullet (DIRECT mode) FK: for each frame, the robot base is reset to
+    ``(root_pos[t], root_quat[t])`` and every joint listed in ``dof_names`` is
+    reset to ``joint_position[t]``. The foot sole bottom is approximated as the
+    foot link world Z minus ``foot_sole_offset`` (T1 collision box bottom edge
+    sits 0.03 m below the link origin).
+
+    Returns ``(root_pos_shifted, offset)`` where ``offset`` is the constant
+    scalar added to ``root_pos[:, 2]``.
+    """
+    if not os.path.exists(urdf_path):
+        raise FileNotFoundError(f"URDF not found: {urdf_path}")
+    try:
+        import pybullet as p
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "pybullet"]
+        )
+        import pybullet as p
+
+    cid = p.connect(p.DIRECT)
+    try:
+        robot = p.loadURDF(urdf_path, useFixedBase=False, physicsClientId=cid)
+        num_joints = p.getNumJoints(robot, physicsClientId=cid)
+        joint_name_to_idx: dict[str, int] = {}
+        link_name_to_idx: dict[str, int] = {}
+        for i in range(num_joints):
+            ji = p.getJointInfo(robot, i, physicsClientId=cid)
+            jname = ji[1].decode("utf-8")
+            lname = ji[12].decode("utf-8")
+            jtype = ji[2]
+            if jtype != p.JOINT_FIXED:
+                joint_name_to_idx[jname] = i
+            link_name_to_idx[lname] = i
+        if left_foot_link not in link_name_to_idx:
+            raise ValueError(
+                f"Link '{left_foot_link}' not found in URDF. "
+                f"Available: {sorted(link_name_to_idx)}"
+            )
+        if right_foot_link not in link_name_to_idx:
+            raise ValueError(
+                f"Link '{right_foot_link}' not found in URDF. "
+                f"Available: {sorted(link_name_to_idx)}"
+            )
+        left_idx = link_name_to_idx[left_foot_link]
+        right_idx = link_name_to_idx[right_foot_link]
+        active: list[tuple[int, int]] = []
+        unmapped: list[str] = []
+        for dof_i, name in enumerate(dof_names):
+            if name in joint_name_to_idx:
+                active.append((dof_i, joint_name_to_idx[name]))
+            else:
+                unmapped.append(name)
+        if unmapped:
+            print(
+                f"  [foot_grounded] WARNING: {len(unmapped)} dof_names not in "
+                f"URDF and ignored: {unmapped}"
+            )
+
+        T = root_pos.shape[0]
+        min_sole_z = float("inf")
+        for t in range(T):
+            p.resetBasePositionAndOrientation(
+                robot,
+                root_pos[t].tolist(),
+                root_quat[t].tolist(),
+                physicsClientId=cid,
+            )
+            for dof_i, pb_j in active:
+                p.resetJointState(
+                    robot,
+                    pb_j,
+                    float(joint_position[t, dof_i]),
+                    0.0,
+                    physicsClientId=cid,
+                )
+            lz = p.getLinkState(robot, left_idx, physicsClientId=cid)[0][2]
+            rz = p.getLinkState(robot, right_idx, physicsClientId=cid)[0][2]
+            sole_z = min(lz, rz) - foot_sole_offset
+            if sole_z < min_sole_z:
+                min_sole_z = sole_z
+    finally:
+        p.disconnect(physicsClientId=cid)
+
+    offset = ground_z + foot_margin - min_sole_z
+    root_pos_shifted = root_pos.copy()
+    root_pos_shifted[:, 2] += offset
+    return root_pos_shifted, float(offset)
+
+
 def build_target_dict(
     pkl_data: dict,
     reindex: list[int] | None,
@@ -168,14 +274,18 @@ def build_target_dict(
     z_offset_strategy: str = "none",
     z_target_min: float = 0.55,
     z_fixed_offset: float = 0.0,
+    urdf_path: str | None = None,
+    foot_margin: float = 0.005,
+    ground_z: float = 0.0,
 ) -> dict:
     """Build a goalkeeper-format dict from a GMR PKL dict.
 
     If ``reindex`` is None, ``dof_pos`` from the PKL is used as-is (no joint
     reordering). ``dof_names`` is stored verbatim under the ``dof_names`` key.
 
-    A Z offset can be applied to ``root_pos`` (see :func:`apply_z_offset`) to
-    correct the trunk height when GMR retargeting outputs sunken roots.
+    A Z offset can be applied to ``root_pos`` (see :func:`apply_z_offset` and
+    :func:`compute_foot_grounded_offset`) to correct the trunk height when GMR
+    retargeting outputs sunken roots.
     """
     fps = float(pkl_data["fps"])
     root_pos = pkl_data["root_pos"].astype(np.float32)
@@ -183,15 +293,36 @@ def build_target_dict(
     dof_pos = pkl_data["dof_pos"].astype(np.float32)
     N = root_pos.shape[0]
 
-    root_pos, z_offset_applied = apply_z_offset(
-        root_pos, z_offset_strategy, z_target_min, z_fixed_offset
-    )
-
-    # Core fields
+    # Joint reindexing happens before FK so PyBullet sees the canonical order.
     if reindex is None:
         joint_pos = dof_pos
     else:
         joint_pos = dof_pos[:, reindex]  # (N, 21)
+
+    if z_offset_strategy == "foot_grounded":
+        if urdf_path is None:
+            raise ValueError(
+                "z_offset_strategy=foot_grounded requires --robot_urdf"
+            )
+        if dof_names is None:
+            raise ValueError(
+                "z_offset_strategy=foot_grounded requires dof_names"
+            )
+        root_pos, z_offset_applied = compute_foot_grounded_offset(
+            root_pos,
+            root_rot,
+            joint_pos,
+            dof_names,
+            urdf_path,
+            ground_z=ground_z,
+            foot_margin=foot_margin,
+        )
+    else:
+        root_pos, z_offset_applied = apply_z_offset(
+            root_pos, z_offset_strategy, z_target_min, z_fixed_offset
+        )
+
+    # Core fields
     joint_vel = compute_joint_velocity(joint_pos, fps)
     base_vel = compute_base_velocity(root_pos, fps)
     base_ang_vel = compute_base_angular_velocity(root_rot, fps)
@@ -242,6 +373,9 @@ def convert_one(
     z_offset_strategy: str = "none",
     z_target_min: float = 0.55,
     z_fixed_offset: float = 0.0,
+    urdf_path: str | None = None,
+    foot_margin: float = 0.005,
+    ground_z: float = 0.0,
 ) -> float:
     """Convert a single GMR PKL to goalkeeper .pt. Returns applied Z offset."""
     with open(pkl_path, "rb") as f:
@@ -252,6 +386,9 @@ def convert_one(
         z_offset_strategy=z_offset_strategy,
         z_target_min=z_target_min,
         z_fixed_offset=z_fixed_offset,
+        urdf_path=urdf_path,
+        foot_margin=foot_margin,
+        ground_z=ground_z,
     )
     torch.save(target, out_path)
     z_new_min = float(target["base_position"][:, 2].min().item())
@@ -366,12 +503,13 @@ def main():
     )
     parser.add_argument(
         "--z_offset_strategy",
-        choices=["auto", "fixed", "none"],
+        choices=["auto", "fixed", "none", "foot_grounded"],
         default=None,
-        help="How to correct root Z (trunk height). 'auto' shifts each motion "
-             "so its minimum Z equals --z_target_min (preserves jumps/squats). "
-             "'fixed' adds --z_fixed_offset. 'none' is passthrough. "
-             "Default: 'auto' for t1, 'none' for g1.",
+        help="How to correct root Z. 'auto' shifts each motion so its minimum "
+             "trunk Z equals --z_target_min. 'fixed' adds --z_fixed_offset. "
+             "'foot_grounded' uses URDF FK to put the lowest foot sole at "
+             "--ground_z + --foot_margin (requires --robot_urdf). 'none' is "
+             "passthrough. Default: 'foot_grounded' for t1, 'none' for g1.",
     )
     parser.add_argument(
         "--z_target_min",
@@ -385,6 +523,27 @@ def main():
         default=0.0,
         help="Constant offset (m) added to root Z for --z_offset_strategy=fixed.",
     )
+    parser.add_argument(
+        "--robot_urdf",
+        default=None,
+        help="URDF path for --z_offset_strategy=foot_grounded (default: "
+             "legged_gym/resources/robots/booster_t1/urdf/T1_serial.urdf for t1; "
+             "no default for g1 — must be provided explicitly).",
+    )
+    parser.add_argument(
+        "--foot_margin",
+        type=float,
+        default=0.005,
+        help="Clearance (m) above ground for the lowest foot sole when using "
+             "--z_offset_strategy=foot_grounded (default 0.005).",
+    )
+    parser.add_argument(
+        "--ground_z",
+        type=float,
+        default=0.0,
+        help="World Z of the ground plane (default 0.0) used by "
+             "--z_offset_strategy=foot_grounded.",
+    )
     args = parser.parse_args()
 
     is_t1 = args.robot == "t1"
@@ -397,7 +556,16 @@ def main():
             else "ViMoS/retarget/GMR/assets/unitree_g1/g1_mocap_29dof.xml"
         )
     if args.z_offset_strategy is None:
-        args.z_offset_strategy = "auto" if is_t1 else "none"
+        args.z_offset_strategy = "foot_grounded" if is_t1 else "none"
+    if args.robot_urdf is None and is_t1:
+        args.robot_urdf = (
+            "legged_gym/resources/robots/booster_t1/urdf/T1_serial.urdf"
+        )
+    if args.z_offset_strategy == "foot_grounded" and not args.robot_urdf:
+        parser.error(
+            "--z_offset_strategy=foot_grounded requires --robot_urdf "
+            "(no default URDF for robot family '" + args.robot + "')"
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -457,6 +625,8 @@ def main():
         f"Z offset strategy: {args.z_offset_strategy}"
         + (f" (target_min={args.z_target_min:.3f}m)" if args.z_offset_strategy == "auto" else "")
         + (f" (fixed={args.z_fixed_offset:+.3f}m)" if args.z_offset_strategy == "fixed" else "")
+        + (f" (urdf={args.robot_urdf}, margin={args.foot_margin:.3f}m, ground_z={args.ground_z:.3f}m)"
+           if args.z_offset_strategy == "foot_grounded" else "")
     )
     for pkl_stem, motion_name in pkl_map.items():
         pkl_path = os.path.join(args.input_dir, f"{pkl_stem}.pkl")
@@ -471,6 +641,9 @@ def main():
             z_offset_strategy=args.z_offset_strategy,
             z_target_min=args.z_target_min,
             z_fixed_offset=args.z_fixed_offset,
+            urdf_path=args.robot_urdf,
+            foot_margin=args.foot_margin,
+            ground_z=args.ground_z,
         )
         converted.append((motion_name, out_path))
         print(f"  {pkl_stem}.pkl → {motion_name}.pt   (Z offset applied: {offset:+.3f}m)")
