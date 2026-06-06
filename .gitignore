@@ -80,8 +80,11 @@ legged_gym/logs/
 
 # Broken symlink (recreated inside container)
 legged_gym/resources/datasets/goalkeeper
-!legged_gym/resources/datasets/goalkeeper.orig/
-!legged_gym/resources/datasets/goalkeeper.orig/**
+legged_gym/resources/datasets/goalkeeper.orig/
+
+# Debug artifacts from t1 replay scripts
+tests/frames/
+tests/videos_t1/
 
 # Memories (copilot session)
 /memories/
@@ -100,8 +103,6 @@ legged_gym/resources/datasets/goalkeeper
 !data/t1_videos/*.mp4
 !data/play_videos/
 !data/play_videos/*.mp4
-!tests/videos_t1/
-!tests/videos_t1/*.mp4
 
 # Repos externos embedados (usar como submodule)
 /ViMoS/
